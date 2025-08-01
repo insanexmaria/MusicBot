@@ -1,6 +1,6 @@
 # Music Discord Bot
 
-A feature-rich music bot for Discord that utilizes **discord.js**, **erela.js**, **express**, and **dotenv**. The bot allows users to enjoy music playback in their Discord servers seamlessly.
+A feature-rich music bot for Discord.The bot allows users to enjoy music playback in their Discord servers seamlessly.
 
 ---
 
@@ -23,7 +23,7 @@ A feature-rich music bot for Discord that utilizes **discord.js**, **erela.js**,
 3. **Install dependencies**  
    Run the following command:
    ```bash
-   npm install discord.js erela.js express dotenv @types/node erela.js-spotify erela.js-filters @discordjs/voice
+   npm install
    ```
 
 4. **Start the bot**  

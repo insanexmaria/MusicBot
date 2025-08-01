@@ -12,11 +12,11 @@
   "dependencies": {
     "@discordjs/voice": "^0.18.0",
     "@types/node": "^22.13.11",
+    "discord-api-types": "^0.38.18",
     "discord.js": "^14.18.0",
     "dotenv": "^16.5.0",
-    "erela.js": "^2.4.0",
-    "erela.js-filters": "^1.2.7",
-    "erela.js-spotify": "^1.2.0",
-    "express": "^5.1.0"
+    "express": "^5.1.0",
+    "kazagumo": "^3.3.0",
+    "shoukaku": "^4.1.1"
   }
 }

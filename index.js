@@ -14,12 +14,13 @@ app.listen(port, '0.0.0.0', () => {
 });
 
 
-const { Manager } = require('erela.js');
+const { Shoukaku, Connectors } = require('shoukaku');
+const { Kazagumo, KazagumoTrack } = require('kazagumo');
 
 const nodes = [{
-  host: 'lava-v3.ajieblogs.eu.org',
-  port: 80,
-  password: 'https://dsc.gg/ajidevserver',
+  name: 'main',
+  url: 'lava-v4.ajieblogs.eu.org:80',
+  auth: 'https://dsc.gg/ajidevserver',
   secure: false,
 }];
 
@@ -30,17 +31,44 @@ const client = new Client({
   ],
 });
 
-const manager = new Manager({
-  nodes,
-  send(id, payload) {
-    const guild = client.guilds.cache.get(id);
+const shoukaku = new Shoukaku(new Connectors.DiscordJS(client), nodes);
+
+const kazagumo = new Kazagumo({
+  defaultSearchEngine: 'youtube_music',
+  send: (guildId, payload) => {
+    const guild = client.guilds.cache.get(guildId);
     if (guild) guild.shard.send(payload);
-  },
-  defaultSearchPlatform: 'youtube',
-  autoPlay: true,
-  clientName: `${client.user?.username || 'Music Bot'}`,
-  plugins: []
-});
+  }
+}, new Connectors.DiscordJS(client), nodes);
+
+// YouTube Music only search function
+async function searchTrack(query, requester) {
+  try {
+    // Removed searching log as requested
+    
+    // Prepare search query
+    let searchQuery = query;
+    
+    // If it's a direct URL, use as-is, otherwise add YouTube Music search prefix
+    if (!query.startsWith('http') && !query.includes(':')) {
+      searchQuery = 'ytmsearch:' + query;
+    }
+    
+    const res = await kazagumo.search(searchQuery, { requester });
+    
+    if (res.loadType !== 'empty' && res.tracks && res.tracks.length > 0) {
+      // Successfully found tracks
+      return res;
+    }
+    
+    // No results found
+    throw new Error('No tracks found on YouTube Music for your search query');
+    
+  } catch (error) {
+    console.error('YouTube Music search failed:', error.message);
+    throw error;
+  }
+}
 
 const commands = [
   new SlashCommandBuilder()
@@ -136,8 +164,7 @@ const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_BOT_TOKEN)
 
 client.once('ready', async () => {
   console.log(`Logged in as ${client.user.tag}`);
-  manager.init(client.user.id);
-
+  
   client.user.setActivity('/help | https://github.com/Unknownzop/MusicBot', { type: ActivityType.Listening });
 
   try {
@@ -149,24 +176,23 @@ client.once('ready', async () => {
   }
 });
 
-client.on('raw', (data) => manager.updateVoiceState(data));
-
 function createMusicEmbed(track) {
   return new EmbedBuilder()
     .setTitle('🎵 Now Playing')
     .setDescription(`[${track.title}](${track.uri})`)
     .addFields(
-      { name: '👤 Artist', value: track.author, inline: true },
-      { name: '⏱️ Duration', value: formatDuration(track.duration), inline: true }
+      { name: '👤 Artist', value: track.author || 'Unknown', inline: true },
+      { name: '⏱️ Duration', value: formatDuration(track.length || track.duration), inline: true }
     )
-    .setThumbnail(track.thumbnail)
+    .setThumbnail(track.thumbnail || track.artworkUrl)
     .setColor('#FF0000');
 }
 
 function formatDuration(duration) {
+  if (!duration || duration === 0) return 'Unknown';
   const minutes = Math.floor(duration / 60000);
-  const seconds = ((duration % 60000) / 1000).toFixed(0);
-  return `${minutes}:${seconds.padStart(2, '0')}`;
+  const seconds = Math.floor((duration % 60000) / 1000);
+  return `${minutes}:${seconds.toString().padStart(2, '0')}`;
 }
 
 function createControlButtons() {
@@ -198,522 +224,768 @@ function createControlButtons() {
 }
 
 client.on('interactionCreate', async (interaction) => {
-  if (!interaction.isCommand() && !interaction.isButton() && !interaction.isStringSelectMenu()) return;
+  try {
+    if (!interaction.isCommand() && !interaction.isButton() && !interaction.isStringSelectMenu()) return;
 
-  if (interaction.isButton()) {
-    if (!interaction.member.voice.channel) {
-      return interaction.reply({ content: 'You need to join a voice channel to use the buttons!', ephemeral: true });
-    }
-    const player = manager.players.get(interaction.guild.id);
-    if (!player) return;
+    if (interaction.isButton()) {
+      // For buttons, reply immediately with ephemeral response
+      if (!interaction.replied && !interaction.deferred) {
+        await interaction.deferReply({ ephemeral: true });
+      }
 
-    const currentTrack = player.queue.current;
-    if (!currentTrack) return;
+      if (!interaction.member.voice.channel) {
+        return interaction.editReply({ content: 'You need to join a voice channel to use the buttons!' });
+      }
+      const player = kazagumo.players.get(interaction.guild.id);
+      if (!player) return interaction.editReply({ content: 'No player found!' });
 
-    if (currentTrack.requester.id !== interaction.user.id) {
-      return interaction.reply({ content: 'Only the person who requested this song can use these buttons!', ephemeral: true });
-    }
+      const currentTrack = player.queue.current;
+      if (!currentTrack) return interaction.editReply({ content: 'No track is currently playing!' });
 
-    switch (interaction.customId) {
-      case 'pause':
-        player.pause(!player.paused);
-        await interaction.reply({ content: player.paused ? 'Paused' : 'Resumed', ephemeral: true });
-        break;
-      case 'skip':
-        const skipMessage = player.get('currentMessage');
-        if (skipMessage && skipMessage.editable) {
-          const disabledButtons = skipMessage.components[0].components.map(button => {
-            return ButtonBuilder.from(button).setDisabled(true);
-          });
-          skipMessage.edit({ components: [new ActionRowBuilder().addComponents(disabledButtons)] });
-        }
-        if (player.queue.length === 0) {
-          const queueEndEmbed = new EmbedBuilder()
+      if (currentTrack.requester.id !== interaction.user.id) {
+        return interaction.editReply({ content: 'Only the person who requested this song can use these buttons!' });
+      }
+
+      switch (interaction.customId) {
+        case 'pause':
+          player.pause(!player.paused);
+          await interaction.editReply({ content: player.paused ? 'Paused' : 'Resumed' });
+          break;
+        case 'skip':
+          const skipMessage = player.data.get('currentMessage');
+          if (skipMessage && skipMessage.editable) {
+            try {
+              const disabledButtons = skipMessage.components[0].components.map(button => {
+                return ButtonBuilder.from(button).setDisabled(true);
+              });
+              await skipMessage.edit({ components: [new ActionRowBuilder().addComponents(disabledButtons)] });
+            } catch (err) {
+              console.error('Error disabling buttons:', err);
+            }
+          }
+          if (player.queue.size === 0) {
+            const queueEndEmbed = new EmbedBuilder()
+              .setDescription('Queue has ended!')
+              .setColor('#FF0000')
+              .setTimestamp();
+            await interaction.channel.send({ embeds: [queueEndEmbed] });
+            player.data.set('manualStop', true);
+          }
+          player.skip();
+          await interaction.editReply({ content: 'Skipped' });
+          break;
+        case 'stop':
+          const stopMessage = player.data.get('currentMessage');
+          if (stopMessage && stopMessage.editable) {
+            try {
+              const disabledButtons = stopMessage.components[0].components.map(button => {
+                return ButtonBuilder.from(button).setDisabled(true);
+              });
+              await stopMessage.edit({ components: [new ActionRowBuilder().addComponents(disabledButtons)] });
+            } catch (err) {
+              console.error('Error disabling buttons:', err);
+            }
+          }
+          player.data.set('manualStop', true);
+          const stopEmbed = new EmbedBuilder()
             .setDescription('Queue has ended!')
             .setColor('#FF0000')
             .setTimestamp();
-          await interaction.channel.send({ embeds: [queueEndEmbed] });
-          player.set('manualStop', true);
+          await interaction.channel.send({ embeds: [stopEmbed] });
+          player.destroy();
+          await interaction.editReply({ content: 'Stopped' });
+          break;
+        case 'loop':
+          const currentLoop = player.loop || 'none';
+          const newLoop = currentLoop === 'none' ? 'track' : 'none';
+          player.setLoop(newLoop);
+          await interaction.editReply({ content: `Loop: ${newLoop === 'none' ? 'Disabled' : 'Enabled'}` });
+          break;
+        case 'queue':
+          const queue = player.queue;
+          const currentTrack2 = player.queue.current;
+          let description = queue.size > 0 ? queue.map((track, i) =>
+            `${i + 1}. [${track.title}](${track.uri})`).join('\n') : 'No songs in queue';
+
+          if (currentTrack2) description = `**Now Playing:**\n[${currentTrack2.title}](${currentTrack2.uri})\n\n**Queue:**\n${description}`;
+
+          const embed = new EmbedBuilder()
+            .setTitle('Queue')
+            .setDescription(description)
+            .setColor('#FF0000')
+            .setTimestamp();
+          await interaction.editReply({ embeds: [embed] });
+          break;
+      }
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId === 'filter') {
+      // For select menus, reply with ephemeral response
+      if (!interaction.replied && !interaction.deferred) {
+        await interaction.deferReply({ ephemeral: true });
+      }
+
+      const player = kazagumo.players.get(interaction.guild.id);
+      if (!player) return interaction.editReply({ content: 'No player found!' });
+
+      const filter = interaction.values[0];
+      player.shoukaku.setFilters({
+        [filter]: true
+      });
+
+      const embed = new EmbedBuilder()
+        .setDescription(`🎵 Applied filter: ${filter}`)
+        .setColor('#FF0000')
+        .setFooter({
+          text: `Requested by ${interaction.user.tag}`,
+          iconURL: interaction.user.displayAvatarURL()
+        })
+        .setTimestamp();
+
+      await interaction.editReply({ embeds: [embed] });
+      return;
+    }
+
+    if (!interaction.isCommand()) return;
+
+    // For commands, defer with non-ephemeral response
+    if (!interaction.replied && !interaction.deferred) {
+      await interaction.deferReply();
+    }
+
+    const { commandName, options } = interaction;
+
+    switch (commandName) {
+      case 'play':
+        if (!interaction.member.voice.channel) {
+          return interaction.editReply({ content: 'Join a voice channel first!' });
         }
-        player.stop();
-        await interaction.reply({ content: 'Skipped', ephemeral: true });
-        break;
-      case 'stop':
-        const stopMessage = player.get('currentMessage');
-        if (stopMessage && stopMessage.editable) {
-          const disabledButtons = stopMessage.components[0].components.map(button => {
-            return ButtonBuilder.from(button).setDisabled(true);
+
+        let player = kazagumo.players.get(interaction.guild.id);
+        
+        if (!player) {
+          player = await kazagumo.createPlayer({
+            guildId: interaction.guild.id,
+            voiceId: interaction.member.voice.channel.id,
+            textId: interaction.channel.id,
+            deaf: true
           });
-          stopMessage.edit({ components: [new ActionRowBuilder().addComponents(disabledButtons)] });
         }
-        player.set('manualStop', true);
-        const stopEmbed = new EmbedBuilder()
-          .setDescription('Queue has ended!')
+
+        // Ensure player is connected to voice channel
+        if (player.voiceId !== interaction.member.voice.channel.id) {
+          player.setVoiceChannel(interaction.member.voice.channel.id);
+        }
+
+        if (!player.twentyFourSeven) player.twentyFourSeven = false;
+
+        const query = options.getString('query');
+        
+        try {
+          // Use enhanced search function with fallback
+          const res = await searchTrack(query, interaction.user);
+
+          if (res.loadType === 'empty' || !res.tracks.length) {
+            const errorEmbed = new EmbedBuilder()
+              .setTitle('❌ No Results Found')
+              .setDescription('No tracks found for your search query. Please try:\n• Different keywords\n• Artist name + song title\n• A direct URL')
+              .setColor('#FF0000')
+              .setFooter({
+                text: `Requested by ${interaction.user.tag}`,
+                iconURL: interaction.user.displayAvatarURL()
+              })
+              .setTimestamp();
+            await interaction.editReply({ embeds: [errorEmbed] });
+            return;
+          }
+
+          if (res.loadType === 'error') {
+            const errorEmbed = new EmbedBuilder()
+              .setTitle('⚠️ Search Error')
+              .setDescription('An error occurred while searching. Please try again or use a different search term.')
+              .setColor('#FF0000')
+              .setFooter({
+                text: `Requested by ${interaction.user.tag}`,
+                iconURL: interaction.user.displayAvatarURL()
+              })
+              .setTimestamp();
+            await interaction.editReply({ embeds: [errorEmbed] });
+            return;
+          }
+
+          // Handle playlist loading
+          if (res.loadType === 'playlist') {
+            const playlist = res.playlist;
+            const tracks = res.tracks;
+            
+            tracks.forEach(track => player.queue.add(track));
+            
+            const playlistEmbed = new EmbedBuilder()
+              .setTitle('📋 Playlist Added')
+              .setDescription(`Added **${tracks.length}** tracks from [${playlist.name}](${query})`)
+              .addFields(
+                { name: '🎵 First Track', value: `[${tracks[0].title}](${tracks[0].uri})`, inline: true },
+                { name: '⏱️ Total Duration', value: formatDuration(tracks.reduce((acc, track) => acc + (track.length || 0), 0)), inline: true }
+              )
+              .setColor('#1DB954')
+              .setFooter({
+                text: `Requested by ${interaction.user.tag}`,
+                iconURL: interaction.user.displayAvatarURL()
+              })
+              .setTimestamp();
+            await interaction.editReply({ embeds: [playlistEmbed] });
+          } else {
+            // Single track
+            const track = res.tracks[0];
+            player.queue.add(track);
+            
+            const embed = new EmbedBuilder()
+              .setTitle('✅ Track Added')
+              .setDescription(`[${track.title}](${track.uri})`)
+              .addFields(
+                { name: '👤 Artist', value: track.author || 'Unknown', inline: true },
+                { name: '⏱️ Duration', value: formatDuration(track.length || track.duration), inline: true },
+                { name: '📍 Position', value: `${player.queue.size}`, inline: true }
+              )
+              .setThumbnail(track.thumbnail || track.artworkUrl)
+              .setColor('#1DB954')
+              .setFooter({
+                text: `Requested by ${interaction.user.tag}`,
+                iconURL: interaction.user.displayAvatarURL()
+              })
+              .setTimestamp();
+            await interaction.editReply({ embeds: [embed] });
+          }
+          
+          // Start playing if not already playing
+          if (!player.playing && !player.paused) {
+            try {
+              await player.play();
+            } catch (playError) {
+              console.error('Error starting playback:', playError);
+              const playErrorEmbed = new EmbedBuilder()
+                .setTitle('❌ Playback Error')
+                .setDescription('Failed to start playback. Please try again or check if the bot has proper permissions.')
+                .setColor('#FF0000')
+                .setFooter({
+                  text: `Requested by ${interaction.user.tag}`,
+                  iconURL: interaction.user.displayAvatarURL()
+                })
+                .setTimestamp();
+              await interaction.followUp({ embeds: [playErrorEmbed] });
+            }
+          }
+          
+        } catch (error) {
+          console.error('Play command error:', error);
+          const errorEmbed = new EmbedBuilder()
+            .setTitle('❌ Search Failed')
+            .setDescription(`Failed to search for tracks: ${error.message}\n\nPlease try:\n• A different search term\n• Checking your internet connection\n• Using a direct URL`)
+            .setColor('#FF0000')
+            .setFooter({
+              text: `Requested by ${interaction.user.tag}`,
+              iconURL: interaction.user.displayAvatarURL()
+            })
+            .setTimestamp();
+          await interaction.editReply({ embeds: [errorEmbed] });
+        }
+        break;
+
+      case 'pause':
+        const pausePlayer = kazagumo.players.get(interaction.guild.id);
+        if (!pausePlayer) return interaction.editReply({ content: 'Not playing anything!' });
+
+        pausePlayer.pause(true);
+        const pauseEmbed = new EmbedBuilder()
+          .setDescription('⏸️ Paused')
           .setColor('#FF0000')
+          .setFooter({ text: `Requested by ${interaction.user.tag}`, iconURL: interaction.user.displayAvatarURL() })
           .setTimestamp();
-        await interaction.channel.send({ embeds: [stopEmbed] });
-        player.destroy();
-        await interaction.reply({ content: 'Stopped', ephemeral: true });
+        await interaction.editReply({ embeds: [pauseEmbed] });
         break;
-      case 'loop':
-        player.setQueueRepeat(!player.queueRepeat);
-        await interaction.reply({ content: `Loop: ${player.queueRepeat ? 'Enabled' : 'Disabled'}`, ephemeral: true });
+
+      case 'resume':
+        const resumePlayer = kazagumo.players.get(interaction.guild.id);
+        if (!resumePlayer) return interaction.editReply({ content: 'Not playing anything!' });
+
+        resumePlayer.pause(false);
+        const resumeEmbed = new EmbedBuilder()
+          .setDescription('▶️ Resumed')
+          .setColor('#FF0000')
+          .setFooter({ text: `Requested by ${interaction.user.tag}`, iconURL: interaction.user.displayAvatarURL() })
+          .setTimestamp();
+        await interaction.editReply({ embeds: [resumeEmbed] });
         break;
+
+      case 'skip':
+        const skipPlayer = kazagumo.players.get(interaction.guild.id);
+        if (!skipPlayer) return interaction.editReply({ content: 'Not playing anything!' });
+
+        skipPlayer.skip();
+        const skipEmbed = new EmbedBuilder()
+          .setDescription('⏭️ Skipped')
+          .setColor('#FF0000')
+          .setFooter({ text: `Requested by ${interaction.user.tag}`, iconURL: interaction.user.displayAvatarURL() })
+          .setTimestamp();
+        await interaction.editReply({ embeds: [skipEmbed] });
+        break;
+
       case 'queue':
-        const queue = player.queue;
-        const currentTrack = player.queue.current;
-        let description = queue.length > 0 ? queue.map((track, i) => 
+        const queuePlayer = kazagumo.players.get(interaction.guild.id);
+        if (!queuePlayer) return interaction.editReply({ content: 'Not playing anything!' });
+
+        const queue = queuePlayer.queue;
+        const currentTrack = queuePlayer.queue.current;
+        let description = queue.size > 0 ? queue.map((track, i) =>
           `${i + 1}. [${track.title}](${track.uri})`).join('\n') : 'No songs in queue';
 
         if (currentTrack) description = `**Now Playing:**\n[${currentTrack.title}](${currentTrack.uri})\n\n**Queue:**\n${description}`;
 
-        const embed = new EmbedBuilder()
-          .setTitle('Queue')
+        const queueEmbed = new EmbedBuilder()
+          .setTitle('🎵 Queue')
           .setDescription(description)
           .setColor('#FF0000')
+          .setFooter({ text: `Requested by ${interaction.user.tag}`, iconURL: interaction.user.displayAvatarURL() })
           .setTimestamp();
-        await interaction.reply({ embeds: [embed], ephemeral: true });
+        await interaction.editReply({ embeds: [queueEmbed] });
         break;
-    }
-    return;
-  }
 
-  if (interaction.isStringSelectMenu() && interaction.customId === 'filter') {
-    const player = manager.players.get(interaction.guild.id);
-    if (!player) return;
+      case 'nowplaying':
+        const npPlayer = kazagumo.players.get(interaction.guild.id);
+        if (!npPlayer) return interaction.editReply({ content: 'Not playing anything!' });
 
-    const filter = interaction.values[0];
-    player.node.send({
-      op: 'filters',
-      guildId: interaction.guild.id,
-      [filter]: true
-    });
+        const npTrack = npPlayer.queue.current;
+        if (!npTrack) return interaction.editReply({ content: 'Not playing anything!' });
 
-    const embed = new EmbedBuilder()
-      .setDescription(`🎵 Applied filter: ${filters[filter]}`)
-      .setColor('#FF0000')
-      .setFooter({ 
-        text: `Requested by ${interaction.user.tag}`,
-        iconURL: interaction.user.displayAvatarURL()
-      })
-      .setTimestamp();
+        const npEmbed = createMusicEmbed(npTrack);
+        await interaction.editReply({ embeds: [npEmbed] });
+        break;
 
-    await interaction.reply({ embeds: [embed] });
-    return;
-  }
+      case 'shuffle':
+        const shufflePlayer = kazagumo.players.get(interaction.guild.id);
+        if (!shufflePlayer) return interaction.editReply({ content: 'Not playing anything!' });
 
-  const { commandName, options } = interaction;
-
-  if (commandName === 'play') {
-    if (!interaction.member.voice.channel) {
-      return interaction.reply({ content: 'Join a voice channel first!', ephemeral: true });
-    }
-
-    const player = manager.create({
-      guild: interaction.guild.id,
-      voiceChannel: interaction.member.voice.channel.id,
-      textChannel: interaction.channel.id,
-      selfDeafen: true
-    });
-
-    if (!player.twentyFourSeven) player.twentyFourSeven = false;
-
-    player.connect();
-
-    const query = options.getString('query');
-    const res = await manager.search(query, interaction.user);
-
-    switch (res.loadType) {
-      case 'TRACK_LOADED':
-      case 'SEARCH_RESULT':
-        if (!res.tracks || res.tracks.length === 0) {
-          await interaction.reply({ content: 'No results found! Please try a different search term.', ephemeral: true });
-          return;
-        }
-        const track = res.tracks[0];
-        player.queue.add(track);
-        const embed = new EmbedBuilder()
-          .setDescription(`Added [${track.title}](${track.uri}) to the queue`)
+        shufflePlayer.queue.shuffle();
+        const shuffleEmbed = new EmbedBuilder()
+          .setDescription('🔀 Shuffled the queue')
           .setColor('#FF0000')
-          .setFooter({ 
+          .setFooter({ text: `Requested by ${interaction.user.tag}`, iconURL: interaction.user.displayAvatarURL() })
+          .setTimestamp();
+        await interaction.editReply({ embeds: [shuffleEmbed] });
+        break;
+
+      case 'loop':
+        const loopPlayer = kazagumo.players.get(interaction.guild.id);
+        if (!loopPlayer) return interaction.editReply({ content: 'Not playing anything!' });
+
+        const mode = options.getString('mode');
+        switch (mode) {
+          case 'off':
+            loopPlayer.setLoop('none');
+            break;
+          case 'track':
+            loopPlayer.setLoop('track');
+            break;
+          case 'queue':
+            loopPlayer.setLoop('queue');
+            break;
+        }
+
+        const loopEmbed = new EmbedBuilder()
+          .setDescription(`🔄 Loop mode set to: ${mode}`)
+          .setColor('#FF0000')
+          .setFooter({ text: `Requested by ${interaction.user.tag}`, iconURL: interaction.user.displayAvatarURL() })
+          .setTimestamp();
+        await interaction.editReply({ embeds: [loopEmbed] });
+        break;
+
+      case 'remove':
+        const removePlayer = kazagumo.players.get(interaction.guild.id);
+        if (!removePlayer) return interaction.editReply({ content: 'Not playing anything!' });
+
+        const pos = options.getInteger('position') - 1;
+        if (pos < 0 || pos >= removePlayer.queue.size) {
+          return interaction.editReply({ content: 'Invalid position!' });
+        }
+
+        const removed = removePlayer.queue.remove(pos);
+        const removeEmbed = new EmbedBuilder()
+          .setDescription(`❌ Removed [${removed.title}](${removed.uri})`)
+          .setColor('#FF0000')
+          .setFooter({ text: `Requested by ${interaction.user.tag}`, iconURL: interaction.user.displayAvatarURL() })
+          .setTimestamp();
+        await interaction.editReply({ embeds: [removeEmbed] });
+        break;
+
+      case 'move':
+        const movePlayer = kazagumo.players.get(interaction.guild.id);
+        if (!movePlayer) return interaction.editReply({ content: 'Not playing anything!' });
+
+        const from = options.getInteger('from') - 1;
+        const to = options.getInteger('to') - 1;
+
+        if (from < 0 || from >= movePlayer.queue.size || to < 0 || to >= movePlayer.queue.size) {
+          return interaction.editReply({ content: 'Invalid position!' });
+        }
+
+        const moveTrack = movePlayer.queue.at(from);
+        movePlayer.queue.remove(from);
+        movePlayer.queue.add(moveTrack, to);
+
+        const moveEmbed = new EmbedBuilder()
+          .setDescription(`📦 Moved [${moveTrack.title}](${moveTrack.uri}) to position ${to + 1}`)
+          .setColor('#FF0000')
+          .setFooter({ text: `Requested by ${interaction.user.tag}`, iconURL: interaction.user.displayAvatarURL() })
+          .setTimestamp();
+        await interaction.editReply({ embeds: [moveEmbed] });
+        break;
+
+      case 'clearqueue':
+        const clearPlayer = kazagumo.players.get(interaction.guild.id);
+        if (!clearPlayer) return interaction.editReply({ content: 'Not playing anything!' });
+
+        clearPlayer.queue.clear();
+        const clearEmbed = new EmbedBuilder()
+          .setDescription('🗑️ Cleared the queue')
+          .setColor('#FF0000')
+          .setFooter({ text: `Requested by ${interaction.user.tag}`, iconURL: interaction.user.displayAvatarURL() })
+          .setTimestamp();
+        await interaction.editReply({ embeds: [clearEmbed] });
+        break;
+
+      case 'stop':
+        const stopPlayer = kazagumo.players.get(interaction.guild.id);
+        if (stopPlayer) {
+          stopPlayer.data.set('manualStop', true);
+          const stopMessage = stopPlayer.data.get('currentMessage');
+          if (stopMessage && stopMessage.editable) {
+            const disabledButtons = stopMessage.components[0].components.map(button => {
+              return ButtonBuilder.from(button).setDisabled(true);
+            });
+            stopMessage.edit({ components: [new ActionRowBuilder().addComponents(disabledButtons)] });
+          }
+          const stopEmbed = new EmbedBuilder()
+            .setDescription('Queue has ended!')
+            .setColor('#FF0000')
+            .setTimestamp();
+          await interaction.channel.send({ embeds: [stopEmbed] });
+          stopPlayer.destroy();
+          await interaction.editReply({ content: '⏹️ Stopped the music and left' });
+        } else {
+          await interaction.editReply({ content: 'Not playing anything!' });
+        }
+        break;
+
+      case 'volume':
+        const volumePlayer = kazagumo.players.get(interaction.guild.id);
+        if (!volumePlayer) return interaction.editReply({ content: 'Not playing anything!' });
+
+        const volume = options.getInteger('level');
+        if (volume < 0 || volume > 100) {
+          return interaction.editReply({ content: 'Volume must be between 0 and 100!' });
+        }
+
+        volumePlayer.setGlobalVolume(volume);
+        await interaction.editReply({ content: `🔊 Volume set to ${volume}%` });
+        break;
+
+      case '247':
+        const tfPlayer = kazagumo.players.get(interaction.guild.id);
+        if (!tfPlayer) return interaction.editReply({ content: 'No music is playing!' });
+
+        tfPlayer.twentyFourSeven = !tfPlayer.twentyFourSeven;
+        const tfEmbed = new EmbedBuilder()
+          .setDescription(`🎵 24/7 mode is now ${tfPlayer.twentyFourSeven ? 'enabled' : 'disabled'}`)
+          .setColor('#FF0000')
+          .setFooter({
             text: `Requested by ${interaction.user.tag}`,
             iconURL: interaction.user.displayAvatarURL()
           })
           .setTimestamp();
-        await interaction.reply({ embeds: [embed] });
-        if (!player.playing && !player.paused) player.play();
+
+        await interaction.editReply({ embeds: [tfEmbed] });
         break;
-      case 'NO_MATCHES':
-        await interaction.reply({ content: 'No results found! Please try a different search term.', ephemeral: true });
+
+      case 'help':
+        const helpEmbed = new EmbedBuilder()
+          .setTitle(`🎵 ${client.user.username} Commands`)
+          .setDescription('Your ultimate music companion with high-quality playback!')
+          .addFields(
+            { name: '🎵 Music Controls', value:
+              '`/play` - Play a song from name/URL\n' +
+              '`/pause` - ⏸️ Pause current playback\n' +
+              '`/resume` - ▶️ Resume playback\n' +
+              '`/stop` - ⏹️ Stop and disconnect\n' +
+              '`/skip` - ⏭️ Skip to next song\n' +
+              '`/volume` - 🔊 Adjust volume (0-100)'
+            },
+            { name: '📑 Queue Management', value:
+              '`/queue` - 📜 View current queue\n' +
+              '`/nowplaying` - 🎵 Show current track\n' +
+              '`/shuffle` - 🔀 Shuffle the queue\n' +
+              '`/loop` - 🔁 Set loop mode\n' +
+              '`/remove` - ❌ Remove a song\n' +
+              '`/move` - ↕️ Move track position'
+            },
+            { name: '⚙️ Utility', value:
+              '`/247` - 🔄 Toggle 24/7 mode\n' +
+              '`/ping` - 📡 Check latency\n' +
+              '`/stats` - 📊 View statistics\n' +
+              '`/invite` - 📨 Invite bot to server\n' +
+              '`/support` - 💬 Join support server'
+            }
+          )
+          .setColor('#FF0000')
+          .setThumbnail(client.user.displayAvatarURL())
+          .setFooter({
+            text: `Made By Unknownz • Requested by ${interaction.user.tag}`,
+            iconURL: interaction.user.displayAvatarURL()
+          })
+          .setTimestamp();
+        await interaction.editReply({ embeds: [helpEmbed] });
         break;
-      case 'LOAD_FAILED':
-        await interaction.reply({ content: 'Failed to load track! Please try again or use a different link.', ephemeral: true });
+
+      case 'invite':
+        const inviteEmbed = new EmbedBuilder()
+          .setTitle('📨 Invite Me')
+          .setDescription(`[Click here to invite me to your server](https://discord.com/api/oauth2/authorize?client_id=${client.user.id}&permissions=8&scope=bot%20applications.commands)`)
+          .setColor('#FF0000')
+          .setFooter({
+            text: `Requested by ${interaction.user.tag}`,
+            iconURL: interaction.user.displayAvatarURL()
+          })
+          .setTimestamp();
+        await interaction.editReply({ embeds: [inviteEmbed] });
         break;
-    }
-  }
 
-  if (commandName === 'pause') {
-    const player = manager.players.get(interaction.guild.id);
-    if (!player) return interaction.reply({ content: 'Not playing anything!', ephemeral: true });
-
-    player.pause(true);
-    const embed = new EmbedBuilder()
-      .setDescription('⏸️ Paused')
-      .setColor('#FF0000')
-      .setFooter({ text: `Requested by ${interaction.user.tag}`, iconURL: interaction.user.displayAvatarURL() })
-      .setTimestamp();
-    await interaction.reply({ embeds: [embed] });
-  }
-
-  if (commandName === 'resume') {
-    const player = manager.players.get(interaction.guild.id);
-    if (!player) return interaction.reply({ content: 'Not playing anything!', ephemeral: true });
-
-    player.pause(false);
-    const embed = new EmbedBuilder()
-      .setDescription('▶️ Resumed')
-      .setColor('#FF0000')
-      .setFooter({ text: `Requested by ${interaction.user.tag}`, iconURL: interaction.user.displayAvatarURL() })
-      .setTimestamp();
-    await interaction.reply({ embeds: [embed] });
-  }
-
-  if (commandName === 'skip') {
-    const player = manager.players.get(interaction.guild.id);
-    if (!player) return interaction.reply({ content: 'Not playing anything!', ephemeral: true });
-
-    player.stop();
-    const embed = new EmbedBuilder()
-      .setDescription('⏭️ Skipped')
-      .setColor('#FF0000')
-      .setFooter({ text: `Requested by ${interaction.user.tag}`, iconURL: interaction.user.displayAvatarURL() })
-      .setTimestamp();
-    await interaction.reply({ embeds: [embed] });
-  }
-
-  if (commandName === 'queue') {
-    const player = manager.players.get(interaction.guild.id);
-    if (!player) return interaction.reply({ content: 'Not playing anything!', ephemeral: true });
-
-    const queue = player.queue;
-    const currentTrack = player.queue.current;
-    let description = queue.length > 0 ? queue.map((track, i) => 
-      `${i + 1}. [${track.title}](${track.uri})`).join('\n') : 'No songs in queue';
-
-    if (currentTrack) description = `**Now Playing:**\n[${currentTrack.title}](${currentTrack.uri})\n\n**Queue:**\n${description}`;
-
-    const embed = new EmbedBuilder()
-      .setTitle('🎵 Queue')
-      .setDescription(description)
-      .setColor('#FF0000')
-      .setFooter({ text: `Requested by ${interaction.user.tag}`, iconURL: interaction.user.displayAvatarURL() })
-      .setTimestamp();
-    await interaction.reply({ embeds: [embed] });
-  }
-
-  if (commandName === 'nowplaying') {
-    const player = manager.players.get(interaction.guild.id);
-    if (!player) return interaction.reply({ content: 'Not playing anything!', ephemeral: true });
-
-    const track = player.queue.current;
-    if (!track) return interaction.reply({ content: 'Not playing anything!', ephemeral: true });
-
-    const embed = createMusicEmbed(track);
-    await interaction.reply({ embeds: [embed] });
-  }
-
-  if (commandName === 'shuffle') {
-    const player = manager.players.get(interaction.guild.id);
-    if (!player) return interaction.reply({ content: 'Not playing anything!', ephemeral: true });
-
-    player.queue.shuffle();
-    const embed = new EmbedBuilder()
-      .setDescription('🔀 Shuffled the queue')
-      .setColor('#FF0000')
-      .setFooter({ text: `Requested by ${interaction.user.tag}`, iconURL: interaction.user.displayAvatarURL() })
-      .setTimestamp();
-    await interaction.reply({ embeds: [embed] });
-  }
-
-  if (commandName === 'loop') {
-    const player = manager.players.get(interaction.guild.id);
-    if (!player) return interaction.reply({ content: 'Not playing anything!', ephemeral: true });
-
-    const mode = options.getString('mode');
-    switch (mode) {
-      case 'off':
-        player.setQueueRepeat(false);
-        player.setTrackRepeat(false);
+      case 'ping':
+        const ping = Math.round(client.ws.ping);
+        const pingEmbed = new EmbedBuilder()
+          .setTitle('🏓 Pong!')
+          .setDescription(`WebSocket Ping: ${ping}ms`)
+          .setColor('#FF0000')
+          .setFooter({
+            text: `Requested by ${interaction.user.tag}`,
+            iconURL: interaction.user.displayAvatarURL()
+          })
+          .setTimestamp();
+        await interaction.editReply({ embeds: [pingEmbed] });
         break;
-      case 'track':
-        player.setQueueRepeat(false);
-        player.setTrackRepeat(true);
+
+      case 'stats':
+        const uptime = Math.round(client.uptime / 1000);
+        const seconds = uptime % 60;
+        const minutes = Math.floor((uptime % 3600) / 60);
+        const hours = Math.floor((uptime % 86400) / 3600);
+        const days = Math.floor(uptime / 86400);
+
+        const statsEmbed = new EmbedBuilder()
+          .setTitle('📊 Bot Statistics')
+          .addFields(
+            { name: '⌚ Uptime', value: `${days}d ${hours}h ${minutes}m ${seconds}s`, inline: true },
+            { name: '🎵 Active Players', value: `${kazagumo.players.size}`, inline: true },
+            { name: '🌐 Servers', value: `${client.guilds.cache.size}`, inline: true },
+            { name: '👥 Users', value: `${client.users.cache.size}`, inline: true },
+            { name: '📡 Ping', value: `${Math.round(client.ws.ping)}ms`, inline: true }
+          )
+          .setColor('#FF0000')
+          .setFooter({
+            text: `Requested by ${interaction.user.tag}`,
+            iconURL: interaction.user.displayAvatarURL()
+          })
+          .setTimestamp();
+        await interaction.editReply({ embeds: [statsEmbed] });
         break;
-      case 'queue':
-        player.setQueueRepeat(true);
-        player.setTrackRepeat(false);
+
+      case 'support':
+        const supportEmbed = new EmbedBuilder()
+          .setTitle('💬 Support Server')
+          .setDescription(`[Click here to join our support server](${process.env.SUPPORT_SERVER})`)
+          .setColor('#FF0000')
+          .setFooter({
+            text: `Requested by ${interaction.user.tag}`,
+            iconURL: interaction.user.displayAvatarURL()
+          })
+          .setTimestamp();
+        await interaction.editReply({ embeds: [supportEmbed] });
+        break;
+
+      default:
+        await interaction.editReply({ content: 'Unknown command!' });
         break;
     }
-
-    const embed = new EmbedBuilder()
-      .setDescription(`🔄 Loop mode set to: ${mode}`)
-      .setColor('#FF0000')
-      .setFooter({ text: `Requested by ${interaction.user.tag}`, iconURL: interaction.user.displayAvatarURL() })
-      .setTimestamp();
-    await interaction.reply({ embeds: [embed] });
-  }
-
-  if (commandName === 'remove') {
-    const player = manager.players.get(interaction.guild.id);
-    if (!player) return interaction.reply({ content: 'Not playing anything!', ephemeral: true });
-
-    const pos = options.getInteger('position') - 1;
-    if (pos < 0 || pos >= player.queue.length) {
-      return interaction.reply({ content: 'Invalid position!', ephemeral: true });
-    }
-
-    const removed = player.queue.remove(pos);
-    const embed = new EmbedBuilder()
-      .setDescription(`❌ Removed [${removed.title}](${removed.uri})`)
-      .setColor('#FF0000')
-      .setFooter({ text: `Requested by ${interaction.user.tag}`, iconURL: interaction.user.displayAvatarURL() })
-      .setTimestamp();
-    await interaction.reply({ embeds: [embed] });
-  }
-
-  if (commandName === 'move') {
-    const player = manager.players.get(interaction.guild.id);
-    if (!player) return interaction.reply({ content: 'Not playing anything!', ephemeral: true });
-
-    const from = options.getInteger('from') - 1;
-    const to = options.getInteger('to') - 1;
-
-    if (from < 0 || from >= player.queue.length || to < 0 || to >= player.queue.length) {
-      return interaction.reply({ content: 'Invalid position!', ephemeral: true });
-    }
-
-    const track = player.queue[from];
-    player.queue.remove(from);
-    player.queue.add(track, to);
-
-    const embed = new EmbedBuilder()
-      .setDescription(`📦 Moved [${track.title}](${track.uri}) to position ${to + 1}`)
-      .setColor('#FF0000')
-      .setFooter({ text: `Requested by ${interaction.user.tag}`, iconURL: interaction.user.displayAvatarURL() })
-      .setTimestamp();
-    await interaction.reply({ embeds: [embed] });
-  }
-
-  if (commandName === 'clearqueue') {
-    const player = manager.players.get(interaction.guild.id);
-    if (!player) return interaction.reply({ content: 'Not playing anything!', ephemeral: true });
-
-    player.queue.clear();
-    const embed = new EmbedBuilder()
-      .setDescription('🗑️ Cleared the queue')
-      .setColor('#FF0000')
-      .setFooter({ text: `Requested by ${interaction.user.tag}`, iconURL: interaction.user.displayAvatarURL() })
-      .setTimestamp();
-    await interaction.reply({ embeds: [embed] });
-  }
-
-  if (commandName === 'stop') {
-    const player = manager.players.get(interaction.guild.id);
-    if (player) {
-      player.set('manualStop', true);
-      const stopMessage = player.get('currentMessage');
-      if (stopMessage && stopMessage.editable) {
-        const disabledButtons = stopMessage.components[0].components.map(button => {
-          return ButtonBuilder.from(button).setDisabled(true);
-        });
-        stopMessage.edit({ components: [new ActionRowBuilder().addComponents(disabledButtons)] });
+  } catch (error) {
+    console.error('Interaction error:', error);
+    try {
+      if (!interaction.replied && !interaction.deferred) {
+        await interaction.reply({ content: 'An error occurred while processing your command!', ephemeral: true });
+      } else if (interaction.deferred && !interaction.replied) {
+        await interaction.editReply({ content: 'An error occurred while processing your command!' });
       }
-      const stopEmbed = new EmbedBuilder()
-        .setDescription('Queue has ended!')
+    } catch (replyError) {
+      console.error('Failed to send error message:', replyError);
+    }
+  }
+});
+
+shoukaku.on('ready', (name) => {
+  console.log(`Node ${name} connected`);
+});
+
+shoukaku.on('error', (name, error) => {
+  console.error(`Node ${name} error:`, error.message || error);
+});
+
+shoukaku.on('close', (name, code, reason) => {
+  console.log(`Node ${name} closed with code ${code} and reason ${reason}`);
+});
+
+shoukaku.on('disconnect', (name, players, moved) => {
+  console.log(`Node ${name} disconnected`);
+  if (moved) {
+    console.log(`${players} players moved to other nodes`);
+  }
+});
+
+kazagumo.on('playerStart', (player, track) => {
+  try {
+    const channel = client.channels.cache.get(player.textId);
+    if (channel) {
+      const embed = createMusicEmbed(track);
+      const buttons = createControlButtons();
+      channel.send({ embeds: [embed], components: buttons }).then(msg => {
+        player.data.set('currentMessage', msg);
+      }).catch(error => {
+        console.error('Failed to send now playing message:', error);
+      });
+    }
+  } catch (error) {
+    console.error('Error in playerStart event:', error);
+  }
+});
+
+kazagumo.on('playerEnd', async (player) => {
+  try {
+    if (player.data.get('manualStop')) return;
+
+    const channel = client.channels.cache.get(player.textId);
+    if (channel) {
+      // Only send queue ended message if there are no more tracks
+      if (player.queue.size === 0) {
+        const embed = new EmbedBuilder()
+          .setDescription('🎵 Queue has ended!')
+          .setColor('#FF0000')
+          .setTimestamp();
+        channel.send({ embeds: [embed] }).catch(error => {
+          console.error('Failed to send queue ended message:', error);
+        });
+      }
+
+      const message = player.data.get('currentMessage');
+      if (message && message.editable) {
+        try {
+          if (message.components && message.components[0] && message.components[0].components) {
+            const disabledButtons = message.components[0].components.map(button => {
+              return ButtonBuilder.from(button).setDisabled(true);
+            });
+            await message.edit({ components: [new ActionRowBuilder().addComponents(disabledButtons)] });
+          }
+        } catch (error) {
+          console.error('Error disabling buttons:', error);
+        }
+      }
+    }
+  } catch (error) {
+    console.error('Error in playerEnd event:', error);
+  }
+});
+
+kazagumo.on('playerError', (player, error) => {
+  console.error('Player error:', error);
+  
+  try {
+    const channel = client.channels.cache.get(player.textId);
+    if (channel) {
+      const errorEmbed = new EmbedBuilder()
+        .setTitle('❌ Playback Error')
+        .setDescription('An error occurred during playback. Skipping to the next track...')
         .setColor('#FF0000')
         .setTimestamp();
-      await interaction.channel.send({ embeds: [stopEmbed] });
-      player.destroy();
-      await interaction.reply({ content: '⏹️ Stopped the music and left', ephemeral: true });
-    } else {
-      await interaction.reply({ content: 'Not playing anything!', ephemeral: true });
+      
+      channel.send({ embeds: [errorEmbed] }).catch(console.error);
+      
+      // Try to skip to next track if available
+      if (player.queue.size > 0) {
+        player.skip();
+      } else {
+        player.destroy();
+      }
     }
+  } catch (err) {
+    console.error('Error handling player error:', err);
   }
+});
 
-  if (commandName === 'volume') {
-    const player = manager.players.get(interaction.guild.id);
-    if (!player) return interaction.reply({ content: 'Not playing anything!', ephemeral: true });
-
-    const volume = options.getInteger('level');
-    if (volume < 0 || volume > 100) {
-      return interaction.reply({ content: 'Volume must be between 0 and 100!', ephemeral: true });
+kazagumo.on('playerException', (player, exception) => {
+  console.error('Player exception:', exception);
+  
+  try {
+    const channel = client.channels.cache.get(player.textId);
+    if (channel) {
+      const exceptionEmbed = new EmbedBuilder()
+        .setTitle('⚠️ Playback Exception')
+        .setDescription('A playback exception occurred. The track may be unavailable or corrupted.')
+        .setColor('#FFA500')
+        .setTimestamp();
+      
+      channel.send({ embeds: [exceptionEmbed] }).catch(console.error);
     }
-
-    player.setVolume(volume);
-    await interaction.reply(`🔊 Volume set to ${volume}%`);
-  }
-
-  if (commandName === '247') {
-    const player = manager.players.get(interaction.guild.id);
-    if (!player) return interaction.reply({ content: 'No music is playing!', ephemeral: true });
-
-    player.twentyFourSeven = !player.twentyFourSeven;
-    const embed = new EmbedBuilder()
-      .setDescription(`🎵 24/7 mode is now ${player.twentyFourSeven ? 'enabled' : 'disabled'}`)
-      .setColor('#FF0000')
-      .setFooter({ 
-        text: `Requested by ${interaction.user.tag}`,
-        iconURL: interaction.user.displayAvatarURL()
-      })
-      .setTimestamp();
-
-    await interaction.reply({ embeds: [embed] });
-  }
-
-  if (commandName === 'help') {
-    const embed = new EmbedBuilder()
-      .setTitle(`🎵 ${client.user.username} Commands`)
-      .setDescription('Your ultimate music companion with high-quality playback!')
-      .addFields(
-        { name: '🎵 Music Controls', value: 
-          '`/play` - Play a song from name/URL\n' +
-          '`/pause` - ⏸️ Pause current playback\n' +
-          '`/resume` - ▶️ Resume playback\n' +
-          '`/stop` - ⏹️ Stop and disconnect\n' +
-          '`/skip` - ⏭️ Skip to next song\n' +
-          '`/volume` - 🔊 Adjust volume (0-100)'
-        },
-        { name: '📑 Queue Management', value: 
-          '`/queue` - 📜 View current queue\n' +
-          '`/nowplaying` - 🎵 Show current track\n' +
-          '`/shuffle` - 🔀 Shuffle the queue\n' +
-          '`/loop` - 🔁 Set loop mode\n' +
-          '`/remove` - ❌ Remove a song\n' +
-          '`/move` - ↕️ Move track position'
-        },
-        { name: '⚙️ Utility', value: 
-          '`/247` - 🔄 Toggle 24/7 mode\n' +
-          '`/ping` - 📡 Check latency\n' +
-          '`/stats` - 📊 View statistics\n' +
-          '`/invite` - 📨 Invite bot to server\n' +
-          '`/support` - 💬 Join support server'
-        }
-      )
-      .setColor('#FF0000')
-      .setThumbnail(client.user.displayAvatarURL())
-      .setFooter({ 
-        text: `Made By Unknownz • Requested by ${interaction.user.tag}`,
-        iconURL: interaction.user.displayAvatarURL()
-      })
-      .setTimestamp();
-    return await interaction.reply({ embeds: [embed] });
-  }
-
-  if (commandName === 'invite') {
-    const embed = new EmbedBuilder()
-      .setTitle('📨 Invite Me')
-      .setDescription(`[Click here to invite me to your server](https://discord.com/api/oauth2/authorize?client_id=${client.user.id}&permissions=8&scope=bot%20applications.commands)`)
-      .setColor('#FF0000')
-      .setFooter({ 
-        text: `Requested by ${interaction.user.tag}`,
-        iconURL: interaction.user.displayAvatarURL()
-      })
-      .setTimestamp();
-    await interaction.reply({ embeds: [embed] });
-  }
-
-  if (commandName === 'ping') {
-    const ping = Math.round(client.ws.ping);
-    const embed = new EmbedBuilder()
-      .setTitle('🏓 Pong!')
-      .setDescription(`WebSocket Ping: ${ping}ms`)
-      .setColor('#FF0000')
-      .setFooter({ 
-        text: `Requested by ${interaction.user.tag}`,
-        iconURL: interaction.user.displayAvatarURL()
-      })
-      .setTimestamp();
-    await interaction.reply({ embeds: [embed] });
-  }
-
-
-
-  if (commandName === 'stats') {
-    const uptime = Math.round(client.uptime / 1000);
-    const seconds = uptime % 60;
-    const minutes = Math.floor((uptime % 3600) / 60);
-    const hours = Math.floor((uptime % 86400) / 3600);
-    const days = Math.floor(uptime / 86400);
-
-    const embed = new EmbedBuilder()
-      .setTitle('📊 Bot Statistics')
-      .addFields(
-        { name: '⌚ Uptime', value: `${days}d ${hours}h ${minutes}m ${seconds}s`, inline: true },
-        { name: '🎵 Active Players', value: `${manager.players.size}`, inline: true },
-        { name: '🌐 Servers', value: `${client.guilds.cache.size}`, inline: true },
-        { name: '👥 Users', value: `${client.users.cache.size}`, inline: true },
-        { name: '📡 Ping', value: `${Math.round(client.ws.ping)}ms`, inline: true }
-      )
-      .setColor('#FF0000')
-      .setFooter({ 
-        text: `Requested by ${interaction.user.tag}`,
-        iconURL: interaction.user.displayAvatarURL()
-      })
-      .setTimestamp();
-    await interaction.reply({ embeds: [embed] });
-  }
-
-  if (commandName === 'support') {
-    const embed = new EmbedBuilder()
-      .setTitle('💬 Support Server')
-      .setDescription(`[Click here to join our support server](${process.env.SUPPORT_SERVER})`)
-      .setColor('#FF0000')
-      .setFooter({ 
-        text: `Requested by ${interaction.user.tag}`,
-        iconURL: interaction.user.displayAvatarURL()
-      })
-      .setTimestamp();
-    await interaction.reply({ embeds: [embed] });
+  } catch (err) {
+    console.error('Error handling player exception:', err);
   }
 });
 
-manager.on('nodeConnect', (node) => {
-  console.log(`Node ${node.options.identifier} connected`);
-});
-
-manager.on('nodeError', (node, error) => {
-  console.error(`Node ${node.options.identifier} error:`, error.message);
-});
-
-manager.on('trackStart', (player, track) => {
-  const channel = client.channels.cache.get(player.textChannel);
-  if (channel) {
-    const embed = createMusicEmbed(track);
-    const buttons = createControlButtons();
-    channel.send({ embeds: [embed], components: buttons }).then(msg => {
-      player.set('currentMessage', msg);
-    });
+// Add additional Kazagumo events for better error handling
+kazagumo.on('playerResolveError', (player, track, message) => {
+  console.error('Player resolve error:', message);
+  
+  try {
+    const channel = client.channels.cache.get(player.textId);
+    if (channel) {
+      const resolveErrorEmbed = new EmbedBuilder()
+        .setTitle('🔍 Track Resolution Error')
+        .setDescription(`Failed to resolve track: **${track.title}**\nReason: ${message}`)
+        .setColor('#FF0000')
+        .setTimestamp();
+      
+      channel.send({ embeds: [resolveErrorEmbed] }).catch(console.error);
+    }
+  } catch (err) {
+    console.error('Error handling resolve error:', err);
   }
 });
 
-manager.on('queueEnd', (player) => {
-  if (player.get('manualStop')) return;
-
-  const channel = client.channels.cache.get(player.textChannel);
-  if (channel) {
-    const embed = new EmbedBuilder()
-      .setDescription('Queue has ended!')
-      .setColor('#FF0000')
-      .setTimestamp();
-    channel.send({ embeds: [embed] });
-
-    const message = player.get('currentMessage');
+kazagumo.on('playerDestroy', async (player) => {
+  console.log(`Player destroyed for guild: ${player.guildId}`);
+  
+  try {
+    // Clean up any stored data
+    const message = player.data.get('currentMessage');
     if (message && message.editable) {
-      const disabledButtons = message.components[0].components.map(button => {
-        return ButtonBuilder.from(button).setDisabled(true);
-      });
-      message.edit({ components: [new ActionRowBuilder().addComponents(disabledButtons)] });
+      try {
+        if (message.components && message.components[0] && message.components[0].components) {
+          const disabledButtons = message.components[0].components.map(button => {
+            return ButtonBuilder.from(button).setDisabled(true);
+          });
+          await message.edit({ components: [new ActionRowBuilder().addComponents(disabledButtons)] });
+        }
+      } catch (error) {
+        console.error('Error disabling buttons in playerDestroy:', error);
+      }
     }
+  } catch (error) {
+    console.error('Error in playerDestroy event:', error);
   }
 });
 

@@ -165,7 +165,7 @@ const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_BOT_TOKEN)
 client.once('ready', async () => {
   console.log(`Logged in as ${client.user.tag}`);
   
-  client.user.setActivity('/help | https://github.com/Unknownzop/MusicBot', { type: ActivityType.Listening });
+  client.user.setActivity('Spotify | gg', { type: ActivityType.Listening });
 
   try {
     console.log('Refreshing slash commands...');
